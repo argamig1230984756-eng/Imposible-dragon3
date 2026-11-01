@@ -31,3 +31,15 @@ Everything is tweakable in `config.yml`.
 
 ## Bedrock (Geyser)
 Bedrock players get action-bar warnings + a sound before tail strikes, lightning breath and ground lightning, since Java particles may not render for them. See `effects.warning-text` (`bedrock` | `everyone` | `off`).
+
+## Shield + crystal timers
+- The dragon is immune while shielded. Destroyed crystals each get their own respawn timer
+  (floating text + a ring that fills up on the ground).
+- Destroy ALL crystals before they come back -> shield breaks, dragon lands and is vulnerable.
+- Window over / phase gate reached -> shield reforms and every crystal returns.
+- 10 minute clock in the boss bar; after that the dragon goes DOOM.
+
+## Rebirth (final form)
+The first time the dragon would die, it refuses: it becomes invulnerable for a few seconds while
+its health refills to 50%, every crystal returns and the shield comes back. It then fights in
+PHASE 4 (FINAL FORM) with faster attacks and +25% damage. The second death is real.

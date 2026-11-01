@@ -1,5 +1,6 @@
 package dev.impossibledragon;
 
+import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Color;
@@ -17,13 +18,16 @@ import org.bukkit.boss.BarColor;
 import org.bukkit.boss.BossBar;
 import org.bukkit.boss.DragonBattle;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.DragonFireball;
 import org.bukkit.entity.EnderCrystal;
 import org.bukkit.entity.EnderDragon;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.LargeFireball;
 import org.bukkit.entity.Mob;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.ShulkerBullet;
 import org.bukkit.entity.WitherSkull;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.potion.PotionEffect;
@@ -33,7 +37,9 @@ import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -44,7 +50,9 @@ import java.util.concurrent.ThreadLocalRandom;
 /** All custom behaviour for one Ender Dragon. */
 public final class DragonFight {
 
-    private enum Ability { FIREBALL, SKULLS, LIGHTNING, MINIONS, ROAR, LIFT, CRYSTAL, TAIL, BREATH }
+    private enum Ability { FIREBALL, SKULLS, LIGHTNING, MINIONS, ROAR, LIFT, TAIL, BREATH, METEORS, ORBS, PULL }
+
+    private enum Shield { UP, BROKEN }
 
     private static final long PERIOD = 10L; // ticks between brain updates
 
@@ -53,16 +61,31 @@ public final class DragonFight {
     private final EnderDragon dragon;
     private final BukkitTask task;
     private final BukkitTask animTask;
-    private double anim = 0;
 
     private final Map<Ability, Long> next = new EnumMap<>(Ability.class);
-    private final List<Location> crystalSpots = new ArrayList<>();
-    private final Set<UUID> crystals = new HashSet<>();
     private final Set<UUID> minions = new HashSet<>();
 
+    // crystals / shield
+    private final List<Location> crystalSpots = new ArrayList<>();
+    private final Map<Integer, UUID> crystalAt = new HashMap<>();      // spot -> living crystal
+    private final Map<Integer, Long> respawnDue = new HashMap<>();     // spot -> tick it returns
+    private final Map<Integer, Long> downSince = new HashMap<>();      // spot -> tick it died
+    private final Map<Integer, ArmorStand> stands = new HashMap<>();   // spot -> timer hologram
+    private final Map<UUID, Long> blockedMsg = new HashMap<>();
+    private Shield shield = Shield.UP;
+    private long brokenUntil = 0;
+    private long lastBlockSound = 0;
+
     private long now = 0;
+    private long fightTicks = 0;
+    private boolean doom = false;
+    private boolean rebirthStarted = false;
+    private boolean rebirthing = false;
+    private boolean reborn = false;
+    private int rebirthStep = 0;
     private int phase = 1;
     private double maxHealth = 200;
+    private double anim = 0;
 
     public DragonFight(ImpossibleDragon plugin, DragonManager manager, EnderDragon dragon, boolean fresh) {
         this.plugin = plugin;
@@ -72,7 +95,7 @@ public final class DragonFight {
         scanCrystals();
         updateBar();
         this.task = Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 20L, PERIOD);
-        this.animTask = Bukkit.getScheduler().runTaskTimer(plugin, this::animateCrystals, 20L, 2L);
+        this.animTask = Bukkit.getScheduler().runTaskTimer(plugin, this::animate, 20L, 2L);
     }
 
     private FileConfiguration cfg() {
@@ -82,7 +105,7 @@ public final class DragonFight {
     // ------------------------------------------------------------------ setup
 
     public void applyStats(boolean fresh) {
-        double max = Math.min(1024.0, Math.max(1.0, cfg().getDouble("dragon.max-health", 800)));
+        double max = Math.min(1024.0, Math.max(1.0, cfg().getDouble("dragon.max-health", 600)));
         AttributeInstance attr = dragon.getAttribute(Attribute.MAX_HEALTH);
         if (attr != null) {
             double old = attr.getBaseValue();
@@ -94,14 +117,15 @@ public final class DragonFight {
     }
 
     private void scanCrystals() {
+        if (!crystalSpots.isEmpty()) return;
         World w = dragon.getWorld();
         for (EnderCrystal c : w.getEntitiesByClass(EnderCrystal.class)) {
             Location l = c.getLocation();
-            // pillar crystals only (the portal-respawn crystals sit much lower)
-            if (l.getY() < 70) continue;
+            if (l.getY() < 70) continue; // pillar crystals only
             if (l.getX() * l.getX() + l.getZ() * l.getZ() > 80 * 80) continue;
+            int idx = crystalSpots.size();
             crystalSpots.add(l.clone());
-            crystals.add(c.getUniqueId());
+            crystalAt.put(idx, c.getUniqueId());
         }
     }
 
@@ -109,6 +133,7 @@ public final class DragonFight {
         task.cancel();
         animTask.cancel();
         removeMinions();
+        clearStands();
     }
 
     public void removeMinions() {
@@ -130,35 +155,56 @@ public final class DragonFight {
 
         updatePhase();
         ensureBossBar();
-        if (now % 20 == 0) crystalHeal();
-        if (on("crystals", 2) && ready(Ability.CRYSTAL, "crystals", 45)) respawnCrystals(1);
+        scanCrystals();
 
         List<Player> targets = targets();
+        if (!targets.isEmpty()) fightTicks += PERIOD;
+        checkDoom();
+        if (rebirthing) {
+            rebirthTick();
+            return;
+        }
+        processShield();
+
+        if (now % 20 == 0) {
+            crystalHeal();
+            updateTimers();
+            updateBar();
+        }
         if (targets.isEmpty()) return;
 
-        if (on("fireball", 1) && ready(Ability.FIREBALL, "fireball", 8)) {
-            volley(targets, cfg().getInt("abilities.fireball.count", 3) + (phase - 1), false);
+        if (on("fireball", 1) && ready(Ability.FIREBALL, "fireball", 7)) {
+            volley(targets, cfg().getInt("abilities.fireball.count", 4) + (phase - 1) + extra(targets), false);
         }
-        if (on("wither-skulls", 2) && ready(Ability.SKULLS, "wither-skulls", 12)) {
-            volley(targets, cfg().getInt("abilities.wither-skulls.count", 3), true);
+        if (on("wither-skulls", 2) && ready(Ability.SKULLS, "wither-skulls", 10)) {
+            volley(targets, cfg().getInt("abilities.wither-skulls.count", 4) + extra(targets), true);
         }
-        if (on("lightning", 2) && ready(Ability.LIGHTNING, "lightning", 10)) {
+        if (on("lightning", 2) && ready(Ability.LIGHTNING, "lightning", 9)) {
             lightning(targets);
         }
         if (on("tail", 1) && anyWithin(targets, cfg().getDouble("abilities.tail.range", 30))
-                && ready(Ability.TAIL, "tail", 7)) {
+                && ready(Ability.TAIL, "tail", 6)) {
             tailStrike();
         }
-        if (on("lightning-breath", 2) && ready(Ability.BREATH, "lightning-breath", 14)) {
+        if (on("lightning-breath", 2) && ready(Ability.BREATH, "lightning-breath", 12)) {
             breath(targets);
         }
-        if (on("minions", 1) && ready(Ability.MINIONS, "minions", 25)) {
+        if (on("meteors", 2) && ready(Ability.METEORS, "meteors", 16)) {
+            meteors(targets);
+        }
+        if (on("void-orbs", 2) && ready(Ability.ORBS, "void-orbs", 14)) {
+            orbs(targets);
+        }
+        if (on("gravity-well", 3) && ready(Ability.PULL, "gravity-well", 28)) {
+            gravityWell(targets);
+        }
+        if (on("minions", 1) && ready(Ability.MINIONS, "minions", 22)) {
             spawnMinions(targets);
         }
-        if (on("roar", 2) && ready(Ability.ROAR, "roar", 30)) {
+        if (on("roar", 2) && ready(Ability.ROAR, "roar", 26)) {
             roar(targets);
         }
-        if (on("levitation", 3) && ready(Ability.LIFT, "levitation", 25)) {
+        if (on("levitation", 3) && ready(Ability.LIFT, "levitation", 22)) {
             lift(targets);
         }
     }
@@ -172,10 +218,12 @@ public final class DragonFight {
     /** Returns true when the ability may fire now and starts its cooldown. */
     private boolean ready(Ability a, String path, int defaultSeconds) {
         double secs = cfg().getDouble("abilities." + path + ".cooldown-seconds", defaultSeconds);
-        if (phase >= 3) secs *= cfg().getDouble("dragon.enrage-cooldown-multiplier", 0.55);
+        if (phase >= 3) secs *= cfg().getDouble("dragon.enrage-cooldown-multiplier", 0.5);
+        if (doom) secs *= cfg().getDouble("fight.doom-cooldown-multiplier", 0.4);
+        if (reborn) secs *= cfg().getDouble("rebirth.cooldown-multiplier", 0.8);
         long cooldown = Math.max(20L, (long) (secs * 20));
         Long due = next.get(a);
-        if (due == null) { // first time seen: start the timer instead of firing instantly
+        if (due == null) {
             next.put(a, now + cooldown);
             return false;
         }
@@ -184,13 +232,15 @@ public final class DragonFight {
         return true;
     }
 
+    private int extra(List<Player> targets) {
+        return Math.min(4, targets.size() / 2);
+    }
+
     private List<Player> targets() {
         List<Player> list = new ArrayList<>();
         Location dl = dragon.getLocation();
         for (Player p : dragon.getWorld().getPlayers()) {
-            if (p.isDead()) continue;
-            GameMode gm = p.getGameMode();
-            if (gm != GameMode.SURVIVAL && gm != GameMode.ADVENTURE) continue;
+            if (!vulnerable(p)) continue;
             if (p.getLocation().distanceSquared(dl) > 200 * 200) continue;
             list.add(p);
         }
@@ -201,13 +251,14 @@ public final class DragonFight {
         return list.get(ThreadLocalRandom.current().nextInt(list.size()));
     }
 
-    // ------------------------------------------------------------------ phases
+    // ------------------------------------------------------------------ phases / doom
 
     private void updatePhase() {
         AttributeInstance attr = dragon.getAttribute(Attribute.MAX_HEALTH);
         if (attr != null) maxHealth = attr.getValue();
+        if (rebirthing) return;
         double frac = dragon.getHealth() / maxHealth;
-        int newPhase = frac > 0.66 ? 1 : (frac > 0.33 ? 2 : 3);
+        int newPhase = reborn ? 4 : (frac > 0.66 ? 1 : (frac > 0.33 ? 2 : 3));
         if (newPhase == phase) return;
 
         boolean up = newPhase > phase;
@@ -216,61 +267,373 @@ public final class DragonFight {
         if (!up) return;
 
         String msg = cfg().getString(phase == 2 ? "messages.phase-2" : "messages.phase-3", "");
-        World w = dragon.getWorld();
-        for (Player p : w.getPlayers()) {
+        for (Player p : dragon.getWorld().getPlayers()) {
             if (!msg.isEmpty()) p.sendMessage(color(msg));
             p.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, SoundCategory.HOSTILE, 4f, 0.5f);
         }
-        if (cfg().getBoolean("abilities.crystals.enabled", true)
-                && cfg().getBoolean("abilities.crystals.respawn-on-phase-change", true)) {
-            respawnCrystals(99);
+        if (shieldFeature()) reformShield(false);
+    }
+
+    private void checkDoom() {
+        long limit = cfg().getLong("fight.time-limit-seconds", 600);
+        if (doom || limit <= 0 || fightTicks / 20 < limit) return;
+        doom = true;
+        titleAll(cfg().getString("messages.doom", "&4&lTIME'S UP - THE DRAGON GOES BERSERK!"), "");
+        for (Player p : dragon.getWorld().getPlayers()) {
+            p.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, SoundCategory.HOSTILE, 8f, 0.4f);
         }
+        updateBar();
     }
 
     private void updateBar() {
         DragonBattle battle = dragon.getDragonBattle();
         if (battle == null) return;
         BossBar bar = battle.getBossBar();
-        String title = cfg().getString("dragon.boss-bar-title", "&5&lImpossible Ender Dragon");
-        bar.setTitle(color(title) + ChatColor.GRAY + " - Phase " + phase);
-        bar.setColor(phase == 3 ? BarColor.RED : (phase == 2 ? BarColor.PINK : BarColor.PURPLE));
+        StringBuilder sb = new StringBuilder(color(cfg().getString("dragon.boss-bar-title", "&5&lImpossible Ender Dragon")));
+        if (rebirthing) {
+            sb.append(ChatColor.GRAY).append(" | ").append(ChatColor.DARK_RED).append("REBIRTH");
+        } else if (phase == 4) {
+            sb.append(ChatColor.GRAY).append(" | ").append(ChatColor.DARK_RED).append("FINAL FORM");
+        } else {
+            sb.append(ChatColor.GRAY).append(" | Phase ").append(phase);
+        }
+        if (shieldFeature()) {
+            if (shield == Shield.UP) {
+                sb.append(ChatColor.GRAY).append(" | ").append(ChatColor.LIGHT_PURPLE).append("SHIELDED ")
+                        .append(ChatColor.GRAY).append('(').append(downCount()).append('/')
+                        .append(crystalSpots.size()).append(" down)");
+            } else {
+                sb.append(ChatColor.GRAY).append(" | ").append(ChatColor.GREEN).append("VULNERABLE ")
+                        .append(Math.max(0, (brokenUntil - now) / 20)).append('s');
+            }
+        }
+        long limit = cfg().getLong("fight.time-limit-seconds", 600);
+        if (limit > 0) {
+            if (doom) {
+                sb.append(ChatColor.GRAY).append(" | ").append(ChatColor.DARK_RED).append("DOOM");
+            } else {
+                long left = Math.max(0, limit - fightTicks / 20);
+                sb.append(ChatColor.GRAY).append(" | ").append(ChatColor.YELLOW)
+                        .append(String.format("%d:%02d", left / 60, left % 60));
+            }
+        }
+        bar.setTitle(sb.toString());
+        bar.setColor(rebirthing ? BarColor.WHITE : (doom || phase >= 3 ? BarColor.RED : (phase == 2 ? BarColor.PINK : BarColor.PURPLE)));
     }
 
-    // ------------------------------------------------------------------ crystals
+    /** Makes sure every player in the End world is subscribed to the boss bar. */
+    private void ensureBossBar() {
+        DragonBattle battle = dragon.getDragonBattle();
+        if (battle == null) return;
+        BossBar bar = battle.getBossBar();
+        bar.setVisible(true);
+        for (Player p : dragon.getWorld().getPlayers()) bar.addPlayer(p);
+    }
+
+    // ------------------------------------------------------------------ shield + crystal timers
+
+    private boolean shieldFeature() {
+        return cfg().getBoolean("shield.enabled", true) && !crystalSpots.isEmpty();
+    }
+
+    private int downCount() {
+        return crystalSpots.size() - crystalAt.size();
+    }
 
     private int aliveCrystals() {
-        crystals.removeIf(id -> {
-            Entity e = Bukkit.getEntity(id);
-            return e == null || !e.isValid();
-        });
-        return crystals.size();
+        return crystalAt.size();
+    }
+
+    private void processShield() {
+        if (!shieldFeature()) return;
+        World w = dragon.getWorld();
+
+        // 1) crystals that were destroyed -> start THEIR OWN timer
+        for (Map.Entry<Integer, UUID> en : new ArrayList<>(crystalAt.entrySet())) {
+            int idx = en.getKey();
+            Entity e = Bukkit.getEntity(en.getValue());
+            if (e != null && e.isValid()) continue;
+            Location spot = crystalSpots.get(idx);
+            if (!w.isChunkLoaded(spot.getBlockX() >> 4, spot.getBlockZ() >> 4)) continue;
+            crystalAt.remove(idx);
+            onCrystalDestroyed(idx);
+        }
+
+        // 2) crystals whose timer ran out come back
+        for (Map.Entry<Integer, Long> en : new ArrayList<>(respawnDue.entrySet())) {
+            if (now >= en.getValue()) respawnSpot(en.getKey());
+        }
+
+        // 3) all crystals down at the same time -> shield breaks
+        if (shield == Shield.UP && crystalAt.isEmpty()) {
+            breakShield();
+        } else if (shield == Shield.BROKEN && now >= brokenUntil) {
+            reformShield(true);
+        }
+    }
+
+    private void onCrystalDestroyed(int idx) {
+        if (shield != Shield.UP) return;
+        long total = (long) (cfg().getDouble("shield.crystal-respawn-seconds", 40) * 20);
+        respawnDue.put(idx, now + total);
+        downSince.put(idx, now);
+        spawnStand(idx);
+
+        String msg = cfg().getString("messages.crystal-down", "");
+        if (!msg.isEmpty() && !crystalAt.isEmpty()) {
+            msg = msg.replace("{down}", String.valueOf(downCount()))
+                    .replace("{total}", String.valueOf(crystalSpots.size()))
+                    .replace("{seconds}", String.valueOf(total / 20));
+            for (Player p : dragon.getWorld().getPlayers()) p.sendActionBar(Component.text(color(msg)));
+        }
+    }
+
+    private void breakShield() {
+        shield = Shield.BROKEN;
+        long seconds = cfg().getLong("shield.broken-seconds", 35);
+        brokenUntil = now + seconds * 20;
+        respawnDue.clear();
+        downSince.clear();
+        clearStands();
+
+        World w = dragon.getWorld();
+        w.spawnParticle(Particle.EXPLOSION_EMITTER, dragon.getLocation(), 6, 3, 2, 3, 0);
+        for (Player p : w.getPlayers()) {
+            p.playSound(p.getLocation(), Sound.ENTITY_WITHER_BREAK_BLOCK, SoundCategory.HOSTILE, 4f, 0.7f);
+        }
+        titleAll(cfg().getString("messages.shield-broken", "&a&lSHIELD BROKEN!"),
+                cfg().getString("messages.shield-broken-sub", "&7Hit it! Vulnerable for {seconds}s")
+                        .replace("{seconds}", String.valueOf(seconds)));
+        if (cfg().getBoolean("shield.land-on-break", true)) {
+            try {
+                dragon.setPhase(EnderDragon.Phase.LAND_ON_PORTAL);
+            } catch (Throwable ignored) {
+                // phase change is cosmetic
+            }
+        }
+        updateBar();
+    }
+
+    private void reformShield(boolean timedOut) {
+        shield = Shield.UP;
+        respawnDue.clear();
+        downSince.clear();
+        clearStands();
+        for (int i = 0; i < crystalSpots.size(); i++) respawnSpot(i);
+
+        if (timedOut) { // you were too slow: the dragon regenerates a bit (never above its phase)
+            double heal = maxHealth * cfg().getDouble("shield.heal-on-reform", 0.05);
+            double ceiling = phase == 1 ? maxHealth : (phase == 2 ? maxHealth * 0.66
+                    : (phase == 3 ? maxHealth * 0.33 : maxHealth * cfg().getDouble("rebirth.health-fraction", 0.5)));
+            heal = Math.min(heal, ceiling - dragon.getHealth());
+            if (heal > 0) dragon.setHealth(Math.min(maxHealth, dragon.getHealth() + heal));
+        }
+        for (Player p : dragon.getWorld().getPlayers()) {
+            p.playSound(p.getLocation(), Sound.BLOCK_BEACON_ACTIVATE, SoundCategory.HOSTILE, 4f, 0.6f);
+        }
+        titleAll(cfg().getString("messages.shield-restored", "&5&lSHIELD RESTORED"),
+                cfg().getString("messages.shield-restored-sub", "&7Destroy every crystal again!"));
+        if (cfg().getBoolean("shield.land-on-break", true)) {
+            try {
+                dragon.setPhase(EnderDragon.Phase.CIRCLING);
+            } catch (Throwable ignored) {
+                // phase change is cosmetic
+            }
+        }
+        updateBar();
+    }
+
+    private void respawnSpot(int idx) {
+        if (crystalAt.containsKey(idx)) {
+            respawnDue.remove(idx);
+            downSince.remove(idx);
+            removeStand(idx);
+            return;
+        }
+        World w = dragon.getWorld();
+        Location spot = crystalSpots.get(idx);
+        if (!w.isChunkLoaded(spot.getBlockX() >> 4, spot.getBlockZ() >> 4)) return; // retry later
+
+        Collection<Entity> near = w.getNearbyEntities(spot, 1.5, 1.5, 1.5, e -> e instanceof EnderCrystal);
+        if (!near.isEmpty()) {
+            crystalAt.put(idx, near.iterator().next().getUniqueId());
+        } else {
+            EnderCrystal c = w.spawn(spot, EnderCrystal.class, ec -> ec.setShowingBottom(false));
+            crystalAt.put(idx, c.getUniqueId());
+            w.spawnParticle(Particle.REVERSE_PORTAL, spot, 60, 0.5, 0.8, 0.5, 0.2);
+            w.playSound(spot, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, SoundCategory.HOSTILE, 3f, 0.8f);
+        }
+        respawnDue.remove(idx);
+        downSince.remove(idx);
+        removeStand(idx);
     }
 
     private void crystalHeal() {
-        double per = cfg().getDouble("dragon.crystal-heal-per-second", 0.5);
+        double per = cfg().getDouble("dragon.crystal-heal-per-second", 1.0);
         if (per <= 0 || dragon.getHealth() >= maxHealth) return;
         int alive = aliveCrystals();
         if (alive == 0) return;
         dragon.setHealth(Math.min(maxHealth, dragon.getHealth() + alive * per));
     }
 
-    private void respawnCrystals(int limit) {
+    // ---- timer holograms (armor stands work for Java AND Bedrock/Geyser)
+
+    private void spawnStand(int idx) {
+        if (!cfg().getBoolean("shield.show-timers", true)) return;
         World w = dragon.getWorld();
-        int spawned = 0;
-        for (Location spot : crystalSpots) {
-            if (spawned >= limit) break;
-            if (!w.isChunkLoaded(spot.getBlockX() >> 4, spot.getBlockZ() >> 4)) continue;
-            boolean exists = !w.getNearbyEntities(spot, 1.5, 1.5, 1.5, e -> e instanceof EnderCrystal).isEmpty();
-            if (exists) continue;
-            EnderCrystal c = w.spawn(spot, EnderCrystal.class, ec -> ec.setShowingBottom(false));
-            crystals.add(c.getUniqueId());
-            w.spawnParticle(Particle.REVERSE_PORTAL, spot, 60, 0.5, 0.8, 0.5, 0.2);
-            w.playSound(spot, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, SoundCategory.HOSTILE, 3f, 0.8f);
-            spawned++;
-        }
+        Location spot = crystalSpots.get(idx).clone().add(0, 2.5, 0);
+        if (!w.isChunkLoaded(spot.getBlockX() >> 4, spot.getBlockZ() >> 4)) return;
+        ArmorStand st = w.spawn(spot, ArmorStand.class, a -> {
+            a.setVisible(false);
+            a.setMarker(true);
+            a.setGravity(false);
+            a.setInvulnerable(true);
+            a.setSilent(true);
+            a.setPersistent(false);
+            a.setCustomNameVisible(true);
+        });
+        stands.put(idx, st);
+        nameStand(idx);
     }
 
-    // ------------------------------------------------------------------ abilities
+    private void nameStand(int idx) {
+        ArmorStand st = stands.get(idx);
+        Long due = respawnDue.get(idx);
+        if (st == null || due == null) return;
+        long secs = Math.max(0, (long) Math.ceil((due - now) / 20.0));
+        st.customName(Component.text(color("&dCrystal returns in &f" + secs + "s")));
+    }
+
+    private void updateTimers() {
+        for (Integer idx : new ArrayList<>(stands.keySet())) nameStand(idx);
+    }
+
+    private void removeStand(int idx) {
+        ArmorStand st = stands.remove(idx);
+        if (st != null) st.remove();
+    }
+
+    private void clearStands() {
+        for (ArmorStand st : stands.values()) st.remove();
+        stands.clear();
+    }
+
+    // ---- rebirth: the dragon "dies" ONCE and rises again in a FINAL FORM (phase 4)
+
+    /** Turns the first lethal hit into the start of the rebirth. */
+    private double lethalGuard(double dmg) {
+        if (rebirthStarted || !cfg().getBoolean("rebirth.enabled", true)) return dmg;
+        double hp = dragon.getHealth();
+        if (dmg < hp) return dmg;
+        startRebirth();
+        return Math.max(0, hp - 1);
+    }
+
+    private void startRebirth() {
+        rebirthStarted = true;
+        rebirthing = true;
+        rebirthStep = 0;
+        removeMinions();
+        clearStands();
+        for (Player p : dragon.getWorld().getPlayers()) {
+            p.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_DEATH, SoundCategory.HOSTILE, 8f, 0.7f);
+        }
+        titleAll(cfg().getString("messages.rebirth", "&4&lTHE DRAGON REFUSES TO DIE!"),
+                cfg().getString("messages.rebirth-sub", "&7It rises again..."));
+        updateBar();
+    }
+
+    private void rebirthTick() {
+        World w = dragon.getWorld();
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        int totalSteps = Math.max(2, (int) (cfg().getDouble("rebirth.duration-seconds", 6) * 2));
+        rebirthStep++;
+        double progress = Math.min(1.0, rebirthStep / (double) totalSteps);
+
+        // health bar visibly refills while it rises
+        double target = maxHealth * cfg().getDouble("rebirth.health-fraction", 0.5);
+        dragon.setHealth(Math.max(1.0, Math.min(maxHealth, 1.0 + (target - 1.0) * progress)));
+
+        Location c = dragon.getLocation();
+        w.spawnParticle(Particle.EXPLOSION_EMITTER, c, 2, 4, 2, 4, 0);
+        w.spawnParticle(Particle.REVERSE_PORTAL, c, 80, 5, 3, 5, 0.3);
+        w.strikeLightningEffect(c.clone().add(r.nextDouble(-12, 12), 0, r.nextDouble(-12, 12)));
+        w.playSound(c, Sound.ENTITY_ENDER_DRAGON_GROWL, SoundCategory.HOSTILE, 6f, 0.5f + (float) progress);
+
+        if (rebirthStep >= totalSteps) completeRebirth();
+    }
+
+    private void completeRebirth() {
+        rebirthing = false;
+        reborn = true;
+        phase = 4;
+        next.clear(); // abilities restart with fresh cooldowns
+        double target = maxHealth * cfg().getDouble("rebirth.health-fraction", 0.5);
+        dragon.setHealth(Math.max(1.0, Math.min(maxHealth, target)));
+        if (shieldFeature()) reformShield(false); // every crystal comes back, shield up again
+
+        String msg = cfg().getString("messages.phase-4", "&4&lFINAL FORM - THE DRAGON IS REBORN!");
+        titleAll(msg, cfg().getString("messages.phase-4-sub", "&7Faster. Stronger. No more second chances."));
+        for (Player p : dragon.getWorld().getPlayers()) {
+            p.sendMessage(color(msg));
+            p.playSound(p.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, SoundCategory.HOSTILE, 8f, 0.4f);
+        }
+        updateBar();
+    }
+
+    // ---- damage rules (called by the listener)
+
+    /** Returns the damage the dragon should actually take (0 = cancel the hit). */
+    public double modifyIncoming(double raw, Player attacker) {
+        if (rebirthing) return 0; // invulnerable while it rises again
+        double cap = cfg().getDouble("dragon.max-damage-per-hit", 30);
+        double dmg;
+        if (shieldFeature()) {
+            if (shield == Shield.UP) {
+                dmg = raw * cfg().getDouble("shield.damage-multiplier", 0.0);
+                if (dmg <= 0) {
+                    blocked(attacker);
+                    return 0;
+                }
+            } else {
+                dmg = raw * cfg().getDouble("shield.broken-damage-multiplier", 1.0);
+                if (cap > 0) dmg = Math.min(dmg, cap);
+                // can't fall through a phase gate in one window; at the gate the shield comes back
+                double floor = phase == 1 ? maxHealth * 0.66 - 0.5 : (phase == 2 ? maxHealth * 0.33 - 0.5 : 0);
+                if (floor > 0) dmg = Math.min(dmg, dragon.getHealth() - floor);
+                return lethalGuard(Math.max(0, dmg));
+            }
+        } else {
+            dmg = raw * cfg().getDouble("dragon.damage-taken-multiplier", 0.6);
+        }
+        if (cap > 0) dmg = Math.min(dmg, cap);
+        return lethalGuard(Math.max(0, dmg));
+    }
+
+    public double damageDealtMultiplier() {
+        double m = cfg().getDouble("dragon.damage-dealt-multiplier", 2.0);
+        if (doom) m *= cfg().getDouble("fight.doom-damage-multiplier", 2.0);
+        if (reborn) m *= cfg().getDouble("rebirth.damage-multiplier", 1.25);
+        return m;
+    }
+
+    private void blocked(Player attacker) {
+        long ms = System.currentTimeMillis();
+        if (ms - lastBlockSound > 400) {
+            lastBlockSound = ms;
+            Location l = dragon.getLocation();
+            dragon.getWorld().playSound(l, Sound.ITEM_SHIELD_BLOCK, SoundCategory.HOSTILE, 1.5f, 0.8f);
+            dragon.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, l, 10, 3, 2, 3, 0.1);
+        }
+        if (attacker == null) return;
+        Long last = blockedMsg.get(attacker.getUniqueId());
+        if (last != null && ms - last < 1500) return;
+        blockedMsg.put(attacker.getUniqueId(), ms);
+        attacker.sendActionBar(Component.text(color("&5&lSHIELDED &7- destroy ALL crystals! &d("
+                + aliveCrystals() + " left)")));
+    }
+
+    // ------------------------------------------------------------------ attacks
 
     private void volley(List<Player> targets, int count, boolean skull) {
         for (int i = 0; i < count; i++) {
@@ -309,7 +672,8 @@ public final class DragonFight {
     }
 
     private void lightning(List<Player> targets) {
-        int bolts = cfg().getInt("abilities.lightning.bolts", 2) + (phase >= 3 ? 1 : 0);
+        int bolts = cfg().getInt("abilities.lightning.bolts", 3) + (phase >= 3 ? 1 : 0) + extra(targets)
+                + (doom ? targets.size() : 0);
         for (int i = 0; i < bolts; i++) {
             final Player victim = randomOf(targets);
             warn(victim, cfg().getString("messages.warn-lightning", ""));
@@ -341,13 +705,110 @@ public final class DragonFight {
         }
     }
 
+    /** Meteor storm: marked circles on the ground, then fireballs fall from the sky. */
+    private void meteors(List<Player> targets) {
+        final World w = dragon.getWorld();
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        int count = cfg().getInt("abilities.meteors.count", 6) + extra(targets) + (phase >= 3 ? 3 : 0);
+        final float power = (float) cfg().getDouble("abilities.meteors.explosion-power", 3.0);
+        for (Player p : targets) warn(p, cfg().getString("messages.warn-meteors", ""));
+
+        for (int i = 0; i < count; i++) {
+            Player victim = randomOf(targets);
+            final Location spot = victim.getLocation().clone().add(r.nextDouble(-7, 7), 0, r.nextDouble(-7, 7));
+            final long startDelay = i * 4L;
+            new BukkitRunnable() {
+                int t = 0;
+
+                @Override
+                public void run() {
+                    if (!dragon.isValid()) {
+                        cancel();
+                        return;
+                    }
+                    if (t == 0) w.playSound(spot, Sound.ENTITY_BLAZE_SHOOT, SoundCategory.HOSTILE, 3f, 0.5f);
+                    for (int k = 0; k < 14; k++) {
+                        double a = k * Math.PI / 7;
+                        w.spawnParticle(Particle.FLAME, spot.getX() + Math.cos(a) * 2.5, spot.getY() + 0.2,
+                                spot.getZ() + Math.sin(a) * 2.5, 1, 0, 0, 0, 0);
+                    }
+                    if (++t >= 12) {
+                        Location sky = spot.clone().add(0, 28, 0);
+                        w.spawn(sky, LargeFireball.class, f -> {
+                            f.setShooter(dragon);
+                            f.setDirection(new Vector(0, -1, 0));
+                            f.setYield(power);
+                            f.setIsIncendiary(false);
+                        });
+                        cancel();
+                    }
+                }
+            }.runTaskTimer(plugin, startDelay, 2L);
+        }
+    }
+
+    /** Homing void orbs (shulker bullets): levitation + damage, they follow you. */
+    private void orbs(List<Player> targets) {
+        int count = cfg().getInt("abilities.void-orbs.count", 3) + extra(targets);
+        for (Player p : targets) warn(p, cfg().getString("messages.warn-orbs", ""));
+        for (int i = 0; i < count; i++) {
+            final Player p = randomOf(targets);
+            final long delay = i * 8L;
+            Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                if (!dragon.isValid() || !p.isOnline() || p.isDead() || !p.getWorld().equals(dragon.getWorld())) return;
+                Location from = dragon.getLocation().add(0, 2, 0);
+                Vector dir = p.getEyeLocation().toVector().subtract(from.toVector());
+                if (dir.lengthSquared() < 1) return;
+                dir.normalize();
+                Location spawn = from.add(dir.multiply(5));
+                dragon.getWorld().spawn(spawn, ShulkerBullet.class, b -> {
+                    b.setShooter(dragon);
+                    b.setTarget(p);
+                });
+            }, delay);
+        }
+    }
+
+    /** Gravity well: everybody near gets dragged towards the dragon for a few seconds. */
+    private void gravityWell(List<Player> targets) {
+        final World w = dragon.getWorld();
+        final double radius = cfg().getDouble("abilities.gravity-well.radius", 45);
+        final double strength = cfg().getDouble("abilities.gravity-well.strength", 0.22);
+        final int duration = cfg().getInt("abilities.gravity-well.duration-ticks", 50);
+        for (Player p : targets) warn(p, cfg().getString("messages.warn-pull", ""));
+        w.playSound(dragon.getLocation(), Sound.ENTITY_ENDER_DRAGON_GROWL, SoundCategory.HOSTILE, 8f, 0.3f);
+
+        new BukkitRunnable() {
+            int t = 0;
+
+            @Override
+            public void run() {
+                if (!dragon.isValid()) {
+                    cancel();
+                    return;
+                }
+                Location c = dragon.getLocation();
+                w.spawnParticle(Particle.PORTAL, c, 60, 4, 2, 4, 0.8);
+                for (Player p : w.getPlayers()) {
+                    if (!vulnerable(p)) continue;
+                    Vector pull = c.toVector().subtract(p.getLocation().toVector());
+                    if (pull.length() > radius || pull.length() < 4) continue;
+                    pull.normalize().multiply(strength);
+                    pull.setY(pull.getY() * 0.4);
+                    p.setVelocity(p.getVelocity().add(pull));
+                }
+                if (++t > duration) cancel();
+            }
+        }.runTaskTimer(plugin, 0L, 1L);
+    }
+
     private void spawnMinions(List<Player> targets) {
         minions.removeIf(id -> {
             Entity e = Bukkit.getEntity(id);
             return e == null || !e.isValid();
         });
-        int cap = cfg().getInt("abilities.minions.max-alive", 10);
-        int perWave = cfg().getInt("abilities.minions.per-wave", 3);
+        int cap = cfg().getInt("abilities.minions.max-alive", 14);
+        int perWave = cfg().getInt("abilities.minions.per-wave", 4) + extra(targets);
         int life = cfg().getInt("abilities.minions.lifetime-seconds", 60);
         List<String> types = cfg().getStringList("abilities.minions.types");
         if (types.isEmpty()) return;
@@ -405,7 +866,7 @@ public final class DragonFight {
             p.addPotionEffect(new PotionEffect(PotionEffectType.DARKNESS, 100, 0));
             p.addPotionEffect(new PotionEffect(PotionEffectType.NAUSEA, 100, 0));
             p.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 60, 1));
-            if (!msg.isEmpty()) p.sendActionBar(net.kyori.adventure.text.Component.text(color(msg)));
+            if (!msg.isEmpty()) p.sendActionBar(Component.text(color(msg)));
         }
     }
 
@@ -414,13 +875,12 @@ public final class DragonFight {
         String msg = cfg().getString("messages.lift", "");
         for (Player p : targets) {
             p.addPotionEffect(new PotionEffect(PotionEffectType.LEVITATION, ticks, 1));
-            if (!msg.isEmpty()) p.sendActionBar(net.kyori.adventure.text.Component.text(color(msg)));
+            if (!msg.isEmpty()) p.sendActionBar(Component.text(color(msg)));
         }
     }
 
     // ------------------------------------------------------------------ bedrock / text warnings
 
-    /** True for Geyser/Floodgate players (Bedrock). Uses Floodgate if present, else the UUID pattern. */
     private boolean isBedrock(Player p) {
         try {
             Class<?> api = Class.forName("org.geysermc.floodgate.api.FloodgateApi");
@@ -431,30 +891,17 @@ public final class DragonFight {
         }
     }
 
-    /** Action-bar warning + sound for players who can't see the particle telegraphs. */
     private void warn(Player p, String msg) {
         if (msg == null || msg.isEmpty()) return;
         String mode = cfg().getString("effects.warning-text", "bedrock");
         if (mode.equalsIgnoreCase("off")) return;
         if (mode.equalsIgnoreCase("bedrock") && !isBedrock(p)) return;
-        p.sendActionBar(net.kyori.adventure.text.Component.text(color(msg)));
+        p.sendActionBar(Component.text(color(msg)));
         p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, SoundCategory.HOSTILE, 1f, 0.5f);
-    }
-
-    // ------------------------------------------------------------------ boss bar
-
-    /** Makes sure every player in the End world is actually subscribed to the boss bar. */
-    private void ensureBossBar() {
-        DragonBattle battle = dragon.getDragonBattle();
-        if (battle == null) return;
-        BossBar bar = battle.getBossBar();
-        bar.setVisible(true);
-        for (Player p : dragon.getWorld().getPlayers()) bar.addPlayer(p);
     }
 
     // ------------------------------------------------------------------ tail + mouth
 
-    /** Horizontal unit vector pointing from the dragon's body towards its tail. */
     private Vector tailDir() {
         Vector v = dragon.getLocation().getDirection().setY(0);
         if (v.lengthSquared() < 1.0E-4) v = new Vector(0, 0, 1);
@@ -481,10 +928,9 @@ public final class DragonFight {
         return false;
     }
 
-    /** Tail strike: telegraphed wind-up, then a 140 degree sweep behind the dragon. */
     private void tailStrike() {
-        final double damage = cfg().getDouble("abilities.tail.damage", 8);
-        final double knock = cfg().getDouble("abilities.tail.knockback", 1.4);
+        final double damage = cfg().getDouble("abilities.tail.damage", 10);
+        final double knock = cfg().getDouble("abilities.tail.knockback", 1.5);
         final World w = dragon.getWorld();
         final Set<UUID> hit = new HashSet<>();
 
@@ -509,7 +955,6 @@ public final class DragonFight {
                             }
                         }
                     }
-                    // wind-up: flames mark where the sweep begins
                     Vector start = dir.clone().rotateAroundY(Math.toRadians(-70));
                     for (double d = 4; d <= 20; d += 2) {
                         Location l = base.clone().add(start.clone().multiply(d));
@@ -548,13 +993,12 @@ public final class DragonFight {
         }.runTaskTimer(plugin, 0L, 1L);
     }
 
-    /** Lightning breath: charges at the mouth, then a beam fires at where you WERE standing. */
     private void breath(List<Player> targets) {
         final Player victim = randomOf(targets);
         final Location lock = victim.getLocation().add(0, 1, 0); // aim is locked -> dodge!
         final World w = dragon.getWorld();
-        final int windup = Math.max(5, cfg().getInt("abilities.lightning-breath.windup-ticks", 24));
-        final double damage = cfg().getDouble("abilities.lightning-breath.damage", 10);
+        final int windup = Math.max(5, cfg().getInt("abilities.lightning-breath.windup-ticks", 22));
+        final double damage = cfg().getDouble("abilities.lightning-breath.damage", 12);
         final double length = cfg().getDouble("abilities.lightning-breath.length", 70);
         final int beamTicks = 8;
         final Set<UUID> hit = new HashSet<>();
@@ -586,7 +1030,7 @@ public final class DragonFight {
                                 mouth.getY() + Math.sin(a) * radius,
                                 mouth.getZ() + Math.sin(a * 1.3) * radius, 1, 0, 0, 0, 0);
                     }
-                    if (t % 4 == 0) { // ring on the locked target spot
+                    if (t % 4 == 0) {
                         for (int k = 0; k < 16; k++) {
                             double a = k * Math.PI / 8;
                             w.spawnParticle(Particle.ELECTRIC_SPARK, lock.getX() + Math.cos(a) * 1.5,
@@ -600,7 +1044,6 @@ public final class DragonFight {
                         dir.normalize();
                         w.playSound(mouth, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.HOSTILE, 8f, 1.4f);
                     }
-                    // jagged beam
                     for (double d = 0; d <= length; d += 1.2) {
                         double x = mouth.getX() + dir.getX() * d + r.nextDouble(-0.35, 0.35);
                         double y = mouth.getY() + dir.getY() * d + r.nextDouble(-0.35, 0.35);
@@ -612,10 +1055,11 @@ public final class DragonFight {
 
                     for (Player p : w.getPlayers()) {
                         if (!vulnerable(p) || hit.contains(p.getUniqueId())) continue;
-                        Vector v = p.getLocation().add(0, 1, 0).toVector().subtract(mouth.toVector());
+                        Vector pv = p.getLocation().add(0, 1, 0).toVector();
+                        Vector v = pv.clone().subtract(mouth.toVector());
                         double along = Math.max(0, Math.min(length, v.dot(dir)));
                         Vector closest = mouth.toVector().add(dir.clone().multiply(along));
-                        if (p.getLocation().add(0, 1, 0).toVector().distanceSquared(closest) <= 2.5 * 2.5) {
+                        if (pv.distanceSquared(closest) <= 2.5 * 2.5) {
                             hit.add(p.getUniqueId());
                             p.damage(damage, dragon);
                             p.setFireTicks(80);
@@ -627,15 +1071,21 @@ public final class DragonFight {
         }.runTaskTimer(plugin, 0L, 1L);
     }
 
-    // ------------------------------------------------------------------ crystal magic circles
+    // ------------------------------------------------------------------ visuals
 
     private void dust(World w, double x, double y, double z, Particle.DustOptions o) {
         w.spawnParticle(Particle.DUST, x, y, z, 1, 0, 0, 0, 0, o);
     }
 
-    private void animateCrystals() {
+    private boolean nearAny(List<Player> viewers, Location l, double dist) {
+        for (Player p : viewers) {
+            if (p.getLocation().distanceSquared(l) < dist * dist) return true;
+        }
+        return false;
+    }
+
+    private void animate() {
         if (!cfg().getBoolean("effects.crystal-circles.enabled", true)) return;
-        if (crystals.isEmpty()) return;
         World w = dragon.getWorld();
         List<Player> viewers = w.getPlayers();
         if (viewers.isEmpty()) return;
@@ -644,29 +1094,71 @@ public final class DragonFight {
         Particle.DustOptions purple = new Particle.DustOptions(Color.fromRGB(170, 40, 255), 1.1f);
         Particle.DustOptions pink = new Particle.DustOptions(Color.fromRGB(255, 120, 255), 0.9f);
 
-        for (UUID id : new ArrayList<>(crystals)) {
+        // living crystals: rune circle + spinning shield
+        for (UUID id : new ArrayList<>(crystalAt.values())) {
             Entity c = Bukkit.getEntity(id);
             if (c == null || !c.isValid()) continue;
             Location base = c.getLocation();
-            boolean near = false;
-            for (Player p : viewers) {
-                if (p.getLocation().distanceSquared(base) < 48 * 48) {
-                    near = true;
-                    break;
-                }
-            }
-            if (!near) continue;
+            if (!nearAny(viewers, base, 48)) continue;
             drawRuneCircle(w, base.clone().add(0, 0.15, 0), purple, pink);
             drawShield(w, base.clone().add(0, 1, 0), purple);
         }
+
+        // destroyed crystals: a ring that fills up as the respawn timer runs out
+        for (Map.Entry<Integer, Long> en : new ArrayList<>(respawnDue.entrySet())) {
+            Location spot = crystalSpots.get(en.getKey());
+            if (!nearAny(viewers, spot, 48)) continue;
+            long since = downSince.getOrDefault(en.getKey(), now);
+            long total = en.getValue() - since;
+            double progress = total <= 0 ? 1 : Math.min(1.0, (now - since) / (double) total);
+            drawTimerRing(w, spot.clone().add(0, 0.15, 0), progress);
+        }
+
+        drawDragonShield(w, viewers);
     }
 
-    /** Flat magic circle on the ground: two counter-rotating dashed rings + a rotating hexagram. */
+    private void drawTimerRing(World w, Location c, double progress) {
+        Particle.DustOptions done = new Particle.DustOptions(Color.fromRGB(255, 200, 60), 1.3f);
+        Particle.DustOptions todo = new Particle.DustOptions(Color.fromRGB(90, 20, 20), 0.8f);
+        int n = 36;
+        for (int i = 0; i < n; i++) {
+            double f = i / (double) n;
+            double a = f * 2 * Math.PI - Math.PI / 2;
+            dust(w, c.getX() + Math.cos(a) * 2.6, c.getY(), c.getZ() + Math.sin(a) * 2.6, f <= progress ? done : todo);
+        }
+    }
+
+    private void drawDragonShield(World w, List<Player> viewers) {
+        if (!shieldFeature()) return;
+        Location c = dragon.getLocation().add(0, 1, 0);
+        if (!nearAny(viewers, c, 64)) return;
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        if (shield == Shield.UP) {
+            Particle.DustOptions purple = new Particle.DustOptions(Color.fromRGB(150, 30, 255), 1.6f);
+            for (int i = 0; i < 14; i++) {
+                Vector v = new Vector(r.nextGaussian(), r.nextGaussian(), r.nextGaussian());
+                if (v.lengthSquared() < 1.0E-4) continue;
+                v.normalize().multiply(8);
+                dust(w, c.getX() + v.getX(), c.getY() + v.getY(), c.getZ() + v.getZ(), purple);
+            }
+            if (r.nextDouble() < 0.4) {
+                Vector v = new Vector(r.nextGaussian(), r.nextGaussian(), r.nextGaussian());
+                if (v.lengthSquared() > 1.0E-4) {
+                    v.normalize().multiply(8);
+                    w.spawnParticle(Particle.ELECTRIC_SPARK, c.getX() + v.getX(), c.getY() + v.getY(),
+                            c.getZ() + v.getZ(), 3, 0.5, 0.5, 0.5, 0.05);
+                }
+            }
+        } else {
+            w.spawnParticle(Particle.CRIT, c, 8, 5, 3, 5, 0.1);
+        }
+    }
+
     private void drawRuneCircle(World w, Location c, Particle.DustOptions main, Particle.DustOptions accent) {
         double outer = 3.2, inner = 2.4;
         int n = 28;
         for (int i = 0; i < n; i++) {
-            if (i % 4 == 3) continue; // dashes
+            if (i % 4 == 3) continue;
             double a = anim * 0.6 + i * 2 * Math.PI / n;
             dust(w, c.getX() + Math.cos(a) * outer, c.getY(), c.getZ() + Math.sin(a) * outer, main);
         }
@@ -686,13 +1178,11 @@ public final class DragonFight {
                 dust(w, c.getX() + x1 + (x2 - x1) * f, c.getY(), c.getZ() + z1 + (z2 - z1) * f, main);
             }
         }
-        // floating runes
         double ra = anim * 1.3;
         w.spawnParticle(Particle.ENCHANT, c.getX() + Math.cos(ra) * outer, c.getY() + 0.8,
                 c.getZ() + Math.sin(ra) * outer, 2, 0.1, 0.3, 0.1, 0.5);
     }
 
-    /** Spinning rings + bubble + electric arcs around the crystal itself. */
     private void drawShield(World w, Location c, Particle.DustOptions main) {
         ThreadLocalRandom r = ThreadLocalRandom.current();
         double radius = 2.2;
@@ -706,7 +1196,6 @@ public final class DragonFight {
                 dust(w, c.getX() + v.getX(), c.getY() + v.getY(), c.getZ() + v.getZ(), main);
             }
         }
-        // faint bubble surface
         for (int i = 0; i < 4; i++) {
             Vector v = new Vector(r.nextGaussian(), r.nextGaussian(), r.nextGaussian());
             if (v.lengthSquared() < 1.0E-4) continue;
@@ -714,7 +1203,6 @@ public final class DragonFight {
             w.spawnParticle(Particle.WITCH, c.getX() + v.getX(), c.getY() + v.getY(), c.getZ() + v.getZ(),
                     1, 0, 0, 0, 0);
         }
-        // electric arc from crystal to the bubble
         if (r.nextDouble() < 0.5) {
             Vector end = new Vector(r.nextGaussian(), r.nextGaussian(), r.nextGaussian());
             if (end.lengthSquared() > 1.0E-4) {
@@ -733,13 +1221,17 @@ public final class DragonFight {
 
     // ------------------------------------------------------------------ misc
 
-    public EnderDragon dragon() {
-        return dragon;
+    private void titleAll(String title, String sub) {
+        for (Player p : dragon.getWorld().getPlayers()) {
+            p.sendTitle(color(title), color(sub), 5, 50, 15);
+        }
     }
 
     public String statusLine() {
-        return String.format("§5Dragon §7HP §f%.0f§7/§f%.0f §7| Phase §f%d §7| Crystals §f%d §7| Minions §f%d",
-                dragon.getHealth(), maxHealth, phase, aliveCrystals(), minions.size());
+        String sh = !shieldFeature() ? "off" : (shield == Shield.UP ? "UP" : "BROKEN " + Math.max(0, (brokenUntil - now) / 20) + "s");
+        return String.format("§5Dragon §7HP §f%.0f§7/§f%.0f §7| Phase §f%d §7| Shield §f%s §7| Crystals §f%d§7/§f%d §7| Minions §f%d §7| Time §f%ds%s",
+                dragon.getHealth(), maxHealth, phase, sh, aliveCrystals(), crystalSpots.size(),
+                minions.size(), fightTicks / 20, doom ? " §4DOOM" : "");
     }
 
     private static String color(String s) {

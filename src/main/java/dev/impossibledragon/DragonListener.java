@@ -49,7 +49,6 @@ public final class DragonListener implements Listener {
     @EventHandler
     public void onSpawn(EntitySpawnEvent e) {
         if (e.getEntity() instanceof EnderDragon dragon) {
-            // wait a tick so the dragon is fully added to the world / battle
             Bukkit.getScheduler().runTask(plugin, () -> {
                 if (dragon.isValid()) manager.track(dragon, true);
             });
@@ -67,19 +66,27 @@ public final class DragonListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onDragonHurt(EntityDamageEvent e) {
-        if (!(e.getEntity() instanceof EnderDragon dragon) || !manager.isTracked(dragon)) return;
+        if (!(e.getEntity() instanceof EnderDragon dragon)) return;
+        DragonFight fight = manager.get(dragon);
+        if (fight == null) return;
 
-        // the dragon must never hurt itself with its own fireballs / explosions
-        if (e instanceof EntityDamageByEntityEvent byEntity && sourceDragon(byEntity.getDamager()) == dragon) {
-            e.setCancelled(true);
-            return;
+        Player attacker = null;
+        if (e instanceof EntityDamageByEntityEvent byEntity) {
+            // the dragon must never hurt itself with its own fireballs / explosions
+            if (sourceDragon(byEntity.getDamager()) == dragon) {
+                e.setCancelled(true);
+                return;
+            }
+            attacker = attackerOf(byEntity.getDamager());
         }
         EntityDamageEvent.DamageCause cause = e.getCause();
         if (cause == EntityDamageEvent.DamageCause.VOID || cause == EntityDamageEvent.DamageCause.KILL) return;
 
-        double dmg = e.getDamage() * cfg().getDouble("dragon.damage-taken-multiplier", 0.6);
-        double cap = cfg().getDouble("dragon.max-damage-per-hit", 25);
-        if (cap > 0) dmg = Math.min(dmg, cap);
+        double dmg = fight.modifyIncoming(e.getDamage(), attacker);
+        if (dmg <= 0) {
+            e.setCancelled(true);
+            return;
+        }
         e.setDamage(dmg);
     }
 
@@ -87,9 +94,11 @@ public final class DragonListener implements Listener {
     public void onPlayerHurtByDragon(EntityDamageByEntityEvent e) {
         if (!(e.getEntity() instanceof Player)) return;
         EnderDragon dragon = sourceDragon(e.getDamager());
-        if (dragon == null || !manager.isTracked(dragon)) return;
+        if (dragon == null) return;
+        DragonFight fight = manager.get(dragon);
+        if (fight == null) return;
 
-        double dmg = e.getDamage() * cfg().getDouble("dragon.damage-dealt-multiplier", 1.6);
+        double dmg = e.getDamage() * fight.damageDealtMultiplier();
         e.setDamage(dmg);
 
         double steal = cfg().getDouble("dragon.lifesteal", 0.5);
@@ -99,11 +108,16 @@ public final class DragonListener implements Listener {
         }
     }
 
-    /** Resolves the dragon behind a damager (dragon itself, its projectiles, its breath clouds). */
     private EnderDragon sourceDragon(Entity damager) {
         if (damager instanceof EnderDragon d) return d;
         if (damager instanceof Projectile p && p.getShooter() instanceof EnderDragon d) return d;
         if (damager instanceof AreaEffectCloud c && c.getSource() instanceof EnderDragon d) return d;
+        return null;
+    }
+
+    private Player attackerOf(Entity damager) {
+        if (damager instanceof Player p) return p;
+        if (damager instanceof Projectile pr && pr.getShooter() instanceof Player p) return p;
         return null;
     }
 
@@ -113,21 +127,21 @@ public final class DragonListener implements Listener {
     public void onFireballHit(ProjectileHitEvent e) {
         if (!(e.getEntity() instanceof DragonFireball fb)) return;
         if (!(fb.getShooter() instanceof EnderDragon dragon) || !manager.isTracked(dragon)) return;
-        double power = cfg().getDouble("abilities.fireball.explosion-power", 2.5);
+        double power = cfg().getDouble("abilities.fireball.explosion-power", 3.0);
         if (power > 0) {
-            // no fire, no block damage - just pain
             fb.getWorld().createExplosion(fb.getLocation(), (float) power, false, false, dragon);
         }
     }
 
     @EventHandler
     public void onExplode(EntityExplodeEvent e) {
-        if (e.getEntity() instanceof WitherSkull skull
-                && skull.getShooter() instanceof EnderDragon dragon
-                && manager.isTracked(dragon)
-                && !cfg().getBoolean("abilities.wither-skulls.break-blocks", false)) {
-            e.blockList().clear();
-        }
+        if (!(e.getEntity() instanceof Projectile pr)
+                || !(pr.getShooter() instanceof EnderDragon dragon)
+                || !manager.isTracked(dragon)) return;
+        boolean allow = pr instanceof WitherSkull
+                ? cfg().getBoolean("abilities.wither-skulls.break-blocks", false)
+                : cfg().getBoolean("abilities.meteors.break-blocks", false);
+        if (!allow) e.blockList().clear();
     }
 
     // ---------------------------------------------------------------- death
@@ -136,7 +150,6 @@ public final class DragonListener implements Listener {
     public void onDeath(EntityDeathEvent e) {
         Entity dead = e.getEntity();
 
-        // minions never drop loot or XP (no farming)
         if (dead.getPersistentDataContainer().has(plugin.minionKey(), PersistentDataType.BYTE)) {
             e.getDrops().clear();
             e.setDroppedExp(0);
@@ -163,7 +176,7 @@ public final class DragonListener implements Listener {
         }
         final Location dropAt = drop;
 
-        int xp = cfg().getInt("rewards.bonus-xp", 3000);
+        int xp = cfg().getInt("rewards.bonus-xp", 5000);
         if (xp > 0) {
             world.spawn(dropAt, ExperienceOrb.class, orb -> orb.setExperience(xp));
         }
